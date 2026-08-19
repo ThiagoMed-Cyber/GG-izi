@@ -1,0 +1,6 @@
+streamlit
+edge-tts
+beautifulsoup4
+pypdf
+mutagen
+requests
