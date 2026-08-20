@@ -1,10 +1,11 @@
 """Interface Web para o Gerador de Audiobooks Jurídicos
 
-Versão Ultra Rápida & Leve:
+Versão Robusta & Ultra Leve:
+- Sem dependência externa de 'num2words' (conversão numérica 100% nativa).
 - Sem sobrecarga de capas/imagens (arquivos MP3 ~30% mais leves).
 - I/O não-bloqueante para escrita de metadados ID3 (run_in_executor).
 - Cache inteligente em disco por hash MD5.
-- Empacotamento ZIP instantâneo em streaming do disco (Zero uso de RAM).
+- Validação estrita de arquivos em disco para evitar FileNotFoundError.
 - Fatiamento semântico de normas jurídicas (sem quebra de incisos e parágrafos).
 """
 
@@ -24,7 +25,7 @@ import zipfile
 import streamlit as st
 
 # =====================================================================
-# 1. MAPEAMENTOS E EXPRESSÕES REGULARES PRÉ-COMPILADAS
+# 1. MAPEAMENTOS, DICIONÁRIOS E CONVERSÃO NUMÉRICA NATIVA
 # =====================================================================
 
 ORDINAIS = {
@@ -104,6 +105,88 @@ VOZ_FALLBACK_PADRAO = "pt-BR-FranciscaNeural"
 DIR_CACHE_GLOBAL = os.path.join(tempfile.gettempdir(), "audiobook_tts_cache")
 os.makedirs(DIR_CACHE_GLOBAL, exist_ok=True)
 
+
+def numero_para_extenso_ptbr(n: int) -> str:
+    """Converte números inteiros para extenso em português nativamente."""
+    if n == 0:
+        return "zero"
+    
+    unidades = ["", "um", "dois", "três", "quatro", "cinco", "seis", "sete", "oito", "nove"]
+    de_10_a_19 = ["dez", "onze", "doze", "treze", "quatorze", "quinze", "dezesseis", "dezessete", "dezoito", "dezenove"]
+    dezenas = ["", "dez", "vinte", "trinta", "quarenta", "cinquenta", "sessenta", "setenta", "oitenta", "noventa"]
+    centenas = ["", "cento", "duzentos", "trezentos", "quatrocentos", "quinhentos", "seiscentos", "setecentos", "oitocentos", "novecentos"]
+    
+    if n == 100:
+        return "cem"
+    
+    partes = []
+    
+    # Milhões
+    milhoes = n // 1_000_000
+    resto = n % 1_000_000
+    if milhoes > 0:
+        if milhoes == 1:
+            partes.append("um milhão")
+        else:
+            partes.append(f"{numero_para_extenso_ptbr(milhoes)} milhões")
+    
+    # Milhares
+    milhares = resto // 1_000
+    resto = resto % 1_000
+    if milhares > 0:
+        if milhares == 1:
+            partes.append("mil")
+        else:
+            partes.append(f"{numero_para_extenso_ptbr(milhares)} mil")
+            
+    # Centenas, dezenas e unidades
+    if resto > 0:
+        c = resto // 100
+        d = (resto % 100) // 10
+        u = resto % 10
+        
+        texto_resto = []
+        if c > 0:
+            if resto == 100:
+                texto_resto.append("cem")
+            else:
+                texto_resto.append(centenas[c])
+        
+        du = resto % 100
+        if 10 <= du <= 19:
+            texto_resto.append(de_10_a_19[du - 10])
+        else:
+            if d > 0:
+                texto_resto.append(dezenas[d])
+            if u > 0:
+                texto_resto.append(unidades[u])
+                
+        if texto_resto:
+            partes.append(" e ".join(texto_resto))
+        
+    return " e ".join(partes)
+
+
+def reais_para_extenso_ptbr(valor: float) -> str:
+    """Converte valores monetários para extenso em português nativamente."""
+    inteiro = int(valor)
+    centavos = int(round((valor - inteiro) * 100))
+    
+    partes = []
+    if inteiro > 0:
+        ext_int = numero_para_extenso_ptbr(inteiro)
+        sufixo = "real" if inteiro == 1 else "reais"
+        partes.append(f"{ext_int} {sufixo}")
+    elif centavos == 0:
+        return "zero reais"
+        
+    if centavos > 0:
+        ext_cent = numero_para_extenso_ptbr(centavos)
+        sufixo_cent = "centavo" if centavos == 1 else "centavos"
+        partes.append(f"{ext_cent} {sufixo_cent}")
+        
+    return " e ".join(partes)
+
 # =====================================================================
 # 2. FUNÇÕES DE PROCESSAMENTO E NORMALIZAÇÃO
 # =====================================================================
@@ -161,13 +244,21 @@ def extrair_texto_web(url: str) -> str:
     sessao.mount("http://", HTTPAdapter(max_retries=estrategia))
     sessao.mount("https://", HTTPAdapter(max_retries=estrategia))
 
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
     
     try:
         response = sessao.get(url, headers=headers, timeout=25)
         response.raise_for_status()
         if not response.content:
             raise ValueError("URL retornou conteúdo vazio")
+    except requests.exceptions.HTTPError:
+        if response.status_code == 403:
+            raise ValueError("O site (ex: Jusbrasil) bloqueou o acesso automático (Erro 403). Use a aba '✍️ Colar Texto' ou use o link oficial do Planalto/Senado.")
+        raise ValueError(f"Erro HTTP {response.status_code} ao acessar a URL.")
     except requests.exceptions.Timeout:
         raise TimeoutError(f"Timeout ao acessar {url}. O servidor de destino demorou a responder.")
     except requests.exceptions.ConnectionError:
@@ -211,7 +302,6 @@ def extrair_texto_web_cached(url: str) -> str:
 
 @st.cache_data(show_spinner=False)
 def normalizar_texto_juridico(texto: str) -> str:
-    from num2words import num2words
     texto = normalizar_unicode(texto)
     texto = converter_caixa_alta_estruturada(texto)
 
@@ -221,7 +311,7 @@ def normalizar_texto_juridico(texto: str) -> str:
     def _reais(m):
         try:
             v = float(m.group(1).replace(".", "").replace(",", "."))
-            return num2words(v, lang="pt_BR", to="currency")
+            return reais_para_extenso_ptbr(v)
         except Exception:
             return m.group(0)
 
@@ -245,7 +335,7 @@ def normalizar_texto_juridico(texto: str) -> str:
 
     def _sub_inciso(m):
         num = romano_para_inteiro(m.group(1).upper())
-        extenso = num2words(num, lang="pt_BR") if num > 0 else m.group(1)
+        extenso = numero_para_extenso_ptbr(num) if num > 0 else m.group(1)
         return f"Inciso {extenso}. "
 
     texto = REGEX_INCISOS.sub(_sub_inciso, texto)
@@ -306,7 +396,6 @@ def dividir_texto_em_blocos_estruturados(texto: str, minutos_por_faixa: int = 5)
         blocos.append("\n".join(bloco_atual))
     return blocos
 
-# Metadados de texto limpos (sem anexar capa / sem imagem)
 def _escrita_id3_leve(caminho_mp3: str, titulo: str, album: str, artista: str, faixa_num: int, total_faixas: int):
     from mutagen.id3 import ID3, ID3NoHeaderError, TALB, TCON, TIT2, TPE1, TRCK
     try:
@@ -403,7 +492,6 @@ async def processar_faixa_individual(
         progresso_tracker["erros"].append(f"Faixa {idx:02d} ({rotulo_artigos}) falhou após retentativas.")
         return None
 
-    # Escrita de metadados sem bloquear a fila do TTS
     await loop.run_in_executor(
         None,
         partial(
@@ -471,7 +559,6 @@ async def sintetizar_faixas_async(
         for falha in progresso_tracker["erros"]:
             st.warning(f"⚠️ {falha}")
 
-    # Playlist M3U ultra leve
     caminho_m3u = os.path.join(pasta_saida, f"{prefixo_limpo}.m3u")
     with open(caminho_m3u, "w", encoding="utf-8") as f:
         f.write("#EXTM3U\n")
@@ -562,8 +649,11 @@ with aba_texto:
 st.markdown("---")
 
 if st.button("🚀 Gerar Audiobook Completo", type="primary", use_container_width=True):
+    # Reseta estados anteriores
     if st.session_state.pasta_temporaria_ativa and os.path.exists(st.session_state.pasta_temporaria_ativa):
         shutil.rmtree(st.session_state.pasta_temporaria_ativa, ignore_errors=True)
+    st.session_state.resultado_gerado = None
+    st.session_state.caminho_zip_disco = None
 
     pasta_temporaria = tempfile.mkdtemp()
     st.session_state.pasta_temporaria_ativa = pasta_temporaria
@@ -617,7 +707,6 @@ if st.button("🚀 Gerar Audiobook Completo", type="primary", use_container_widt
                 st.error("Nenhuma faixa pôde ser sintetizada.")
                 st.stop()
 
-            # Criação do ZIP direto no disco (Zero uso de RAM)
             st.write("⚡ Gerando pacote ZIP de download...")
             prefixo_arq = re.sub(r"[^\w\-]", "_", nome_lei_input)
             caminho_zip = os.path.join(pasta_temporaria, f"{prefixo_arq}_audiobook.zip")
@@ -643,52 +732,59 @@ if st.button("🚀 Gerar Audiobook Completo", type="primary", use_container_widt
             st.stop()
 
 # =====================================================================
-# 5. TOCADOR, DOWNLOADS E TEXTO NORMALIZADO
+# 5. TOCADOR, DOWNLOADS E TEXTO NORMALIZADO (COM VALIDAÇÃO DE ARQUIVO)
 # =====================================================================
 
 if st.session_state.resultado_gerado and st.session_state.caminho_zip_disco:
-    dados = st.session_state.resultado_gerado
     caminho_zip = st.session_state.caminho_zip_disco
-    tamanho_mb = os.path.getsize(caminho_zip) / (1024 * 1024)
 
-    st.success(f"🎉 **{len(dados['faixas'])} faixas** geradas com sucesso a **{dados['velocidade']}x**!")
+    # Verifica se o arquivo físico realmente existe no disco
+    if os.path.exists(caminho_zip):
+        dados = st.session_state.resultado_gerado
+        tamanho_mb = os.path.getsize(caminho_zip) / (1024 * 1024)
 
-    st.markdown("### 🎧 Reproduzir e Baixar Faixas Individuais")
-    nomes_faixas = [os.path.basename(f[0]) for f in dados["faixas"]]
-    faixa_selecionada = st.selectbox("Selecione a faixa para reproduzir:", nomes_faixas)
+        st.success(f"🎉 **{len(dados['faixas'])} faixas** geradas com sucesso a **{dados['velocidade']}x**!")
 
-    idx_sel = nomes_faixas.index(faixa_selecionada)
-    caminho_faixa = dados["faixas"][idx_sel][0]
+        st.markdown("### 🎧 Reproduzir e Baixar Faixas Individuais")
+        nomes_faixas = [os.path.basename(f[0]) for f in dados["faixas"]]
+        faixa_selecionada = st.selectbox("Selecione a faixa para reproduzir:", nomes_faixas)
 
-    if os.path.exists(caminho_faixa):
-        with open(caminho_faixa, "rb") as f_audio:
-            audio_bytes = f_audio.read()
-            st.audio(audio_bytes, format="audio/mp3")
+        idx_sel = nomes_faixas.index(faixa_selecionada)
+        caminho_faixa = dados["faixas"][idx_sel][0]
 
-            col_btn, _ = st.columns([1, 2])
-            with col_btn:
-                st.download_button(
-                    label=f"⬇️ Baixar apenas esta faixa ({faixa_selecionada})",
-                    data=audio_bytes,
-                    file_name=faixa_selecionada,
-                    mime="audio/mp3",
-                    key=f"dl_single_{faixa_selecionada}"
-                )
+        if os.path.exists(caminho_faixa):
+            with open(caminho_faixa, "rb") as f_audio:
+                audio_bytes = f_audio.read()
+                st.audio(audio_bytes, format="audio/mp3")
 
-    st.markdown("---")
-    c1, c2 = st.columns(2)
-    c1.metric("📦 Tamanho do Pacote ZIP", f"{tamanho_mb:.1f} MB")
-    c2.metric("🎵 Total de Faixas Geradas", f"{len(dados['faixas'])}")
+                col_btn, _ = st.columns([1, 2])
+                with col_btn:
+                    st.download_button(
+                        label=f"⬇️ Baixar apenas esta faixa ({faixa_selecionada})",
+                        data=audio_bytes,
+                        file_name=faixa_selecionada,
+                        mime="audio/mp3",
+                        key=f"dl_single_{faixa_selecionada}"
+                    )
 
-    with open(caminho_zip, "rb") as f_zip:
-        st.download_button(
-            label="⬇️ Baixar Audiobook Completo (.ZIP)",
-            data=f_zip,
-            file_name=os.path.basename(caminho_zip),
-            mime="application/zip",
-            type="primary",
-            use_container_width=True,
-        )
+        st.markdown("---")
+        c1, c2 = st.columns(2)
+        c1.metric("📦 Tamanho do Pacote ZIP", f"{tamanho_mb:.1f} MB")
+        c2.metric("🎵 Total de Faixas Geradas", f"{len(dados['faixas'])}")
 
-    with st.expander("📄 Ver transcrição fonética normalizada"):
-        st.text_area("Texto Processado:", value=dados["texto_limpo"][:5000] + ("..." if len(dados["texto_limpo"]) > 5000 else ""), height=220, disabled=True)
+        with open(caminho_zip, "rb") as f_zip:
+            st.download_button(
+                label="⬇️ Baixar Audiobook Completo (.ZIP)",
+                data=f_zip,
+                file_name=os.path.basename(caminho_zip),
+                mime="application/zip",
+                type="primary",
+                use_container_width=True,
+            )
+
+        with st.expander("📄 Ver transcrição fonética normalizada"):
+            st.text_area("Texto Processado:", value=dados["texto_limpo"][:5000] + ("..." if len(dados["texto_limpo"]) > 5000 else ""), height=220, disabled=True)
+    else:
+        # Se os arquivos expiraram do disco temporário, reseta a sessão de forma segura
+        st.session_state.resultado_gerado = None
+        st.session_state.caminho_zip_disco = None
